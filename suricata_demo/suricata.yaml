@@ -1,0 +1,18 @@
+%YAML 1.1
+---
+runmode: single
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+af-packet:
+  - interface: lo
+    threads: 1
+classification-file: /dev/null
+reference-config-file: /dev/null
+threshold-file: /dev/null
+stats:
+  enabled: no

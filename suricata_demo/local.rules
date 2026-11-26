@@ -1,0 +1,1 @@
+alert udp 127.0.0.1 any -> 127.0.0.1 any (msg:"SOC demo benign UDP marker"; content:"SOC-AI-SURICATA-DEMO-2026"; sid:1000001; rev:1;)

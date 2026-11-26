@@ -115,6 +115,44 @@ Or with a custom log file:
 python agent.py /path/to/custom/access.log
 ```
 
+### Suricata EVE alerts
+
+With Suricata and Python 3 on PATH, run the automated demo from the repository root.
+
+```bash
+python3 suricata_demo/run.py
+```
+
+The demo uses only a local rule and two test UDP packets, one with a harmless
+marker. It prefers live Linux loopback capture and selects offline PCAP when
+the raw socket is unavailable. Use `--mode live` or `--mode pcap` to select a
+mode explicitly, or `--suricata /path/to/suricata` to select a binary. The demo
+verifies the signature in real EVE output, SQLite field values and CLI summary,
+and zero added rows on reimport. It cleans up the temporary artifacts. In the
+cloud test, Suricata 7.0.10 processed the generated PCAP and produced one alert
+for SID 1000001 (severity 3). SQLite contained one alert, and reimport added zero
+rows. Live capture remained unverified because opening the AF_PACKET socket on
+loopback failed with `Operation not permitted`.
+
+```bash
+python3 suricata_eve.py --db sensor.sqlite3 import /path/to/eve.json
+python3 suricata_eve.py --db sensor.sqlite3 follow /path/to/eve.json
+python3 suricata_eve.py --db sensor.sqlite3 list
+python3 suricata_eve.py --db sensor.sqlite3 summary
+python3 -m unittest -v
+```
+
+Use one reader per source path and stop `follow` with Ctrl+C. Complete records
+advance the durable byte cursor, including skipped non-alert records and rejected
+malformed records. An incomplete line waits for a newline. While running,
+`follow` drains the previous file before switching to a replacement at the
+same path. After restart, it reads the current file. It does not discover
+archives or recover unread records already removed by rotation. Rewrites
+are detected by file identity, size or the fingerprint at the cursor boundary.
+Identical alert JSON at the same source path is stored once. EVE severity stays
+in the original Suricata scale. The import and CLI use only the Python standard
+library and SQLite.
+
 ### Query Stored Events
 
 ```bash
