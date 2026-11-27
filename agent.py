@@ -1,12 +1,19 @@
 import os
-import re
 import sqlite3
 from collections import defaultdict, Counter
 from datetime import datetime
 import json
 import pandas as pd
 from langchain_ollama import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate
+from incident_triage import (
+    DB_FILE,
+    DEFAULT_MIN_ATTEMPTS,
+    DEFAULT_WINDOW_SECONDS,
+    find_cases,
+    parse_timestamp,
+    read_log,
+    save_cases,
+)
 
 
 # =========================
@@ -17,8 +24,6 @@ model = ChatOllama(model="llama3.1", temperature=0)
 # =========================
 # DATABASE SETUP
 # =========================
-DB_FILE = "soc_events.db"
-
 def init_database():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -104,10 +109,6 @@ def detect_events(ip, method, url, status, user_agent):
     if any(path in u for path in scanning_paths):
         events.append("SCAN")
 
-    # Brute force heuristic - multiple login attempts with 403/401
-    if "/admin/login" in u and status in ["401", "403"]:
-        events.append("BRUTE_FORCE")
-
     # Scanner user agents
     scanner_patterns = ["nmap", "dirbuster", "sqlmap", "masscan", 
                         "nikto", "metasploit", "curl/", "python-requests"]
@@ -121,53 +122,40 @@ def detect_events(ip, method, url, status, user_agent):
 # =========================
 # LOG PARSER
 # =========================
-LOG_PATTERN = re.compile(
-    r'(?P<ip>\d+\.\d+\.\d+\.\d+)\s-\s-\s\[(?P<time>.*?)\]\s'
-    r'"(?P<method>\w+)\s(?P<url>.*?)\sHTTP/1\.\d"\s'
-    r'(?P<status>\d+)\s\d+\s".*?"\s"(?P<ua>.*?)"'
-)
-
-def parse_logs(file_path):
+def parse_logs(file_path, min_attempts=DEFAULT_MIN_ATTEMPTS,
+               window_seconds=DEFAULT_WINDOW_SECONDS):
     if not os.path.exists(file_path):
         return {"error": "File not found"}
 
+    source_records = list(read_log(file_path))
+    cases = find_cases(file_path, source_records, min_attempts, window_seconds)
+    if cases:
+        save_cases(DB_FILE, cases)
+    brute_force_lines = {item["line"] for case in cases for item in case["evidence"]}
+
     records = []
+    for number, record in source_records:
+        events = detect_events(
+            record["ip"], record["method"], record["url"], record["status"], record["ua"]
+        )
+        if number in brute_force_lines:
+            events.append("BRUTE_FORCE")
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line in f:
-            m = LOG_PATTERN.search(line)
-            if not m:
-                continue
-
-            d = m.groupdict()
-
-            events = detect_events(
-                d["ip"],
-                d["method"],
-                d["url"],
-                d["status"],
-                d["ua"]
+        if events:
+            severity = max(
+                (MITRE_MAP[event]["severity"] for event in events),
+                key=("ŚREDNIE", "WYSOKIE", "KRYTYCZNE").index,
             )
+            record["events"] = events
+            record["status"] = int(record["status"])
+            record["severity"] = severity
+            records.append(record)
 
-            if events:
-                # Get severity from MITRE map
-                severity = "ŚREDNIE"
-                for event in events:
-                    if event in MITRE_MAP and MITRE_MAP[event]["severity"] == "KRYTYCZNE":
-                        severity = "KRYTYCZNE"
-                    elif event in MITRE_MAP and MITRE_MAP[event]["severity"] == "WYSOKIE":
-                        if severity != "KRYTYCZNE":
-                            severity = "WYSOKIE"
-
-                d["events"] = events
-                d["status"] = int(d["status"])
-                d["severity"] = severity
-                records.append(d)
-                
-                # Store in database
-                for event in events:
-                    store_event(d["time"], d["ip"], d["method"], d["url"], 
-                               d["status"], d["ua"], event, severity)
+            for event in events:
+                store_event(
+                    record["time"], record["ip"], record["method"], record["url"],
+                    record["status"], record["ua"], event, severity,
+                )
 
     if not records:
         return {"error": "No suspicious activity detected"}
@@ -263,7 +251,7 @@ def get_attack_timeline(summary):
             })
     
     # Sort by time
-    timeline.sort(key=lambda x: datetime.strptime(x["time"], "%d/%b/%Y:%H:%M:%S +0200"))
+    timeline.sort(key=lambda x: parse_timestamp(x["time"]))
     return timeline
 
 
@@ -398,7 +386,8 @@ Important: Do NOT make up any information. Use ONLY the provided data. Be techni
 # =========================
 # PIPELINE
 # =========================
-def run(log_file):
+def run(log_file, min_attempts=DEFAULT_MIN_ATTEMPTS,
+        window_seconds=DEFAULT_WINDOW_SECONDS):
     init_database()
     
     print("\n" + "="*60)
@@ -406,7 +395,7 @@ def run(log_file):
     print("="*60)
     
     print("\n[1/6] Parsing server logs...")
-    df = parse_logs(log_file)
+    df = parse_logs(log_file, min_attempts, window_seconds)
 
     if isinstance(df, dict) and "error" in df:
         print(f"❌ Error: {df['error']}")
@@ -501,22 +490,21 @@ def get_critical_events():
 # MAIN
 # =========================
 if __name__ == "__main__":
-    import sys
-    
-    LOG_FILE = "server.log"
+    import argparse
 
-    if len(sys.argv) > 1:
-        LOG_FILE = sys.argv[1]
+    parser = argparse.ArgumentParser(description="Generate a SOC incident report")
+    parser.add_argument("log_file", nargs="?", default="server.log")
+    parser.add_argument("--min-attempts", type=int, default=DEFAULT_MIN_ATTEMPTS)
+    parser.add_argument("--window-seconds", type=int, default=DEFAULT_WINDOW_SECONDS)
+    args = parser.parse_args()
+    if not os.path.exists(args.log_file):
+        parser.error(f"{args.log_file} not found")
+    if args.min_attempts < 2 or args.window_seconds < 1:
+        parser.error("Use at least 2 attempts and a positive window in seconds.")
 
-    if not os.path.exists(LOG_FILE):
-        print(f"❌ Error: {LOG_FILE} not found")
-        print("Usage: python agent.py [path_to_logfile]")
-    else:
-        report = run(LOG_FILE)
-        
-        # Print first 100 lines of report to console
-        lines = report.split("\n")[:100]
-        print("\n--- REPORT PREVIEW ---")
-        print("\n".join(lines))
-        if len(report.split("\n")) > 100:
-            print("\n... (see full report in output file)")
+    report = run(args.log_file, args.min_attempts, args.window_seconds)
+    lines = report.splitlines()
+    print("\n--- REPORT PREVIEW ---")
+    print("\n".join(lines[:100]))
+    if len(lines) > 100:
+        print("\n... (see full report in output file)")

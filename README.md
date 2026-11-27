@@ -77,7 +77,7 @@ pip install -r requirements.txt
 
 ### 4. Start Ollama LLM (if not running)
 
-The agent requires a local Ollama instance with llama3.1 model:
+The optional SOC report workflow requires a local Ollama instance with the llama3.1 model. Incident Triage uses Python's standard library and SQLite.
 
 ```bash
 ollama run llama3.1
@@ -114,6 +114,57 @@ Or with a custom log file:
 ```bash
 python agent.py /path/to/custom/access.log
 ```
+
+### Incident Triage without Ollama
+
+Run the following from the repository root in Bash. The example writes a small
+access log and database to a temporary directory.
+
+```bash
+demo="$(mktemp -d)"
+for second in {0..9}; do
+    printf '192.0.2.10 - - [11/Jun/2026:12:00:%02d +0200] "POST /admin/login HTTP/1.1" 401 0 "-" "Browser"\n' "$second"
+done > "$demo/access.log"
+
+python incident_triage.py --db "$demo/triage.sqlite3" scan "$demo/access.log"
+python incident_triage.py --db "$demo/triage.sqlite3" list
+case_id="$(python incident_triage.py --db "$demo/triage.sqlite3" list | python -c 'import json, sys; print(json.load(sys.stdin)[0]["id"])')"
+python incident_triage.py --db "$demo/triage.sqlite3" set-status "$case_id" investigating --comment "Compare with authentication logs"
+python incident_triage.py --db "$demo/triage.sqlite3" scan "$demo/access.log"
+python incident_triage.py --db "$demo/triage.sqlite3" list
+```
+
+The first listing shows one case with status `new` and 10 attempts. The final
+listing shows the same case ID, status `investigating` and the saved comment.
+Each case includes its source path, IP, endpoint, UTC start and end, rationale,
+and evidence with one-based source line numbers, UTC timestamps and HTTP statuses.
+Supported statuses are `new`, `investigating`, `confirmed_threat`,
+`false_positive` and `authorized_test`. Each update stores the latest comment.
+
+```bash
+python incident_triage.py scan /path/to/access.log --min-attempts 12 --window-seconds 240
+python incident_triage.py list
+```
+
+Omitting `--db` uses `soc_events.db` in the current directory, including cases
+created by `agent.py`. The report CLI accepts the same threshold options.
+Running the standalone scan stores cases only. Case identity uses the resolved
+source path and the case's evidence. Re-reading the same file with the same
+settings preserves cases and review status. Changes to the file, its path, or
+thresholds can yield another case if the source or evidence changes. This
+version analyzes each file independently and keeps a single status and comment
+per case.
+
+To run the tests, install the report test dependencies in your virtual
+environment and run:
+
+```bash
+python -m pip install pandas langchain-ollama tabulate
+python -m unittest -v
+```
+
+The tests cover the offline triage CLI and exercise the report pipeline with a
+test double. A real-model reporting check is an optional integration test.
 
 ### Query Stored Events
 
@@ -154,7 +205,13 @@ Patterns: `OR 1=1`, `UNION SELECT`, `' or '1'='1'`, Admin bypass attempts
 Pattern: `${jndi:` in User-Agent or URL (JNDI Injection)
 
 ### Brute Force Detection
-Pattern: Multiple login attempts to `/admin/login.php` with 403/401 status codes
+The default heuristic marks at least 10 HTTP 401/403 responses from one IP
+to the same login path within an inclusive 300-second window. Supported paths
+are `/admin/login` and `/admin/login.php`. Query strings are ignored for grouping.
+Overlapping qualifying windows form one case. Numeric timezone offsets are
+normalized to UTC before sorting, so input rows can be out of order. The rule
+indicates suspicious activity for review. HTTP 200 is ignored by the rule and
+provides no confirmation of successful authentication.
 
 ### Scanning Detection
 Patterns:
